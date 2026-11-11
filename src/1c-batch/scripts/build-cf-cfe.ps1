@@ -11,7 +11,7 @@
 .EXAMPLE
     .\build-cf-cfe.ps1 -XmlDir 'C:\repo\ut\src\cfe_НЭПТ' -OutFile 'C:\build\nept.cfe'
 .EXAMPLE
-    .\build-cf-cfe.ps1 -XmlDir 'C:\repo\ut\src\cf' -OutCf 'C:\build\ut.cf' `
+    .\build-cf-cfe.ps1 -XmlDir 'C:\repo\ut\src\cf' -OutFile 'C:\build\ut.cf' `
         -V8Path 'C:\Program Files\1cv8\<версия>\bin\1cv8.exe' -KeepBase
 #>
 [CmdletBinding()]
@@ -33,18 +33,42 @@ param(
     [switch]$KeepBase
 )
 
-$ErrorActionPreference = 'Stop'
+# Общие настройки навыка: остановка по ошибке и вывод в UTF-8 (иначе кириллица в сообщениях искажается).
+. "$PSScriptRoot\_common.ps1"
+
+function Resolve-FullPath {
+    # Полный путь относительно текущей папки PowerShell.
+    # [IO.Path]::GetFullPath считает от папки процесса, а она после Set-Location не меняется.
+    param([string]$Path)
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Get-DevBaseV8 {
+    # Платформа проекта из .1c-devbase.ps1 ($ONEC_PATH), если настроечный файл есть.
+    # Сам файл для сборки не обязателен, поэтому его отсутствие — не ошибка.
+    foreach ($p in @(
+            (Join-Path (Get-Location) '.1c-devbase.ps1'),
+            (Join-Path (Get-Location) 'tools\.1c-devbase.ps1'))) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            . $p
+            if ($ONEC_PATH) { return $ONEC_PATH }
+        }
+    }
+    return $null
+}
 
 function Find-V8 {
     param([string]$ExplicitPath)
 
-    if ($ExplicitPath) { return [IO.Path]::GetFullPath($ExplicitPath) }
+    if ($ExplicitPath) { return (Resolve-FullPath $ExplicitPath) }
+    $fromDevBase = Get-DevBaseV8
+    if ($fromDevBase) { return (Resolve-FullPath $fromDevBase) }
     if ($env:V8_PATH) {
         $fromEnv = $env:V8_PATH
         if (Test-Path -LiteralPath $fromEnv -PathType Container) {
             $fromEnv = Join-Path $fromEnv '1cv8.exe'
         }
-        return [IO.Path]::GetFullPath($fromEnv)
+        return (Resolve-FullPath $fromEnv)
     }
 
     $candidates = @()
@@ -136,7 +160,8 @@ function Check-PlatformFormat {
         $parsed.Build -ge 20 -and $parsed.Build -le 27) {
         $supportedFormat = [version]("2." + ($parsed.Build - 7))
     }
-    elseif ($parsed.Major -eq 8 -and $parsed.Minor -eq 5 -and $parsed.Build -ge 1) {
+    elseif ($parsed.Major -eq 8 -and $parsed.Minor -eq 5 -and $parsed.Build -eq 1) {
+        # Только 8.5.1: формат следующих версий 8.5 неизвестен, для них проверку не делаем.
         $supportedFormat = [version]'2.21'
     }
 
@@ -148,7 +173,9 @@ function Check-PlatformFormat {
     }
 }
 
-function Invoke-Designer {
+function Invoke-V8Step {
+    # Своя функция, а не Invoke-Designer из _common.ps1: та подключается к базе из .1c-devbase,
+    # а здесь нужна временная база и проверка результата по /DumpResult.
     param(
         [string]$Step,
         [string[]]$Arguments,
@@ -166,12 +193,16 @@ function Invoke-Designer {
 
     $logText = ''
     if (Test-Path -LiteralPath $LogFile -PathType Leaf) {
+        # Пустой лог (1С при тихом успехе пишет в него только BOM) читается как $null —
+        # заменяем пустой строкой, иначе .Trim() ниже падает.
         $logText = Get-Content -LiteralPath $LogFile -Raw -Encoding UTF8
+        if ($null -eq $logText) { $logText = '' }
     }
 
     $batchResult = $null
     if (Test-Path -LiteralPath $ResultFile -PathType Leaf) {
-        $batchResult = (Get-Content -LiteralPath $ResultFile -Raw).Trim().Trim([char]0xFEFF)
+        $batchResult = Get-Content -LiteralPath $ResultFile -Raw
+        if ($null -ne $batchResult) { $batchResult = $batchResult.Trim().Trim([char]0xFEFF) }
     }
 
     $logForDisplay = $logText.Trim()
@@ -197,7 +228,9 @@ function Move-BuiltArtifact {
         if (-not $AllowReplace) {
             throw "Во время сборки по пути '$OutputPath' появился файл. Без -Force перезапись запрещена."
         }
-        [IO.File]::Replace($StagePath, $OutputPath, $null)
+        # [NullString]::Value, а не $null: PowerShell превращает $null в пустую строку,
+        # и Replace падает с «Путь имеет недопустимую форму».
+        [IO.File]::Replace($StagePath, $OutputPath, [NullString]::Value)
     }
     else {
         [IO.File]::Move($StagePath, $OutputPath)
@@ -205,6 +238,9 @@ function Move-BuiltArtifact {
 }
 
 $source = (Resolve-Path -LiteralPath $XmlDir -ErrorAction Stop).ProviderPath
+# Черта на конце (её дописывает автодополнение по Tab) в кавычках превращается в \" и ломает
+# командную строку 1С. Корень диска (D:\) не трогаем.
+if ($source.Length -gt 3) { $source = $source.TrimEnd('\', '/') }
 if (-not (Test-Path -LiteralPath $source -PathType Container)) {
     throw "Ожидался каталог XML-выгрузки: $source"
 }
@@ -235,7 +271,7 @@ if ($meta.IsExtension) {
     $extensionName = $meta.Name
 }
 
-$output = [IO.Path]::GetFullPath($OutFile)
+$output = Resolve-FullPath $OutFile
 $outputExt = [IO.Path]::GetExtension($output)
 if (-not $outputExt) {
     $output = $output + $expectedExt
@@ -274,7 +310,7 @@ New-Item -ItemType Directory -Path $base -Force | Out-Null
 
 try {
     Write-Host '[1/3] Создание временной файловой базы...'
-    Invoke-Designer -Step 'создание базы' `
+    Invoke-V8Step -Step 'создание базы' `
         -Arguments @('CREATEINFOBASE', "File=`"$base`"") `
         -LogFile (Join-Path $work 'create.log') `
         -ResultFile (Join-Path $work 'create.result')
@@ -289,7 +325,7 @@ try {
     }
 
     Write-Host "[2/3] Загрузка XML $artifactLabel в конфигуратор..."
-    Invoke-Designer -Step 'загрузка XML' -Arguments $loadArgs `
+    Invoke-V8Step -Step 'загрузка XML' -Arguments $loadArgs `
         -LogFile (Join-Path $work 'load.log') `
         -ResultFile (Join-Path $work 'load.result')
 
@@ -303,7 +339,7 @@ try {
     }
 
     Write-Host "[3/3] Сохранение $artifactLabel в $expectedExt..."
-    Invoke-Designer -Step "выгрузка $kind" -Arguments $dumpArgs `
+    Invoke-V8Step -Step "выгрузка $kind" -Arguments $dumpArgs `
         -LogFile (Join-Path $work 'dump.log') `
         -ResultFile (Join-Path $work 'dump.result')
 
